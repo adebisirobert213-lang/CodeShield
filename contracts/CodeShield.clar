@@ -107,3 +107,287 @@
 (map-set tier-multipliers { tier: tier-medium } { multiplier: u150 })
 (map-set tier-multipliers { tier: tier-high } { multiplier: u200 })
 (map-set tier-multipliers { tier: tier-critical } { multiplier: u300 })
+
+
+;; public functions
+
+;; Create a new bounty with STX escrow
+(define-public (create-bounty 
+  (amount uint)
+  (tier uint)
+  (github-issue-url (string-ascii 256))
+  (github-repo (string-ascii 128))
+  (title (string-ascii 128))
+  (description (string-ascii 512))
+  (duration-blocks uint))
+  (let 
+    (
+      (bounty-id (var-get next-bounty-id))
+      (expires-at (+ block-height duration-blocks))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (and (>= tier tier-low) (<= tier tier-critical)) err-invalid-tier)
+    (asserts! (<= duration-blocks max-bounty-duration) err-invalid-amount)
+    
+    ;; Transfer STX to contract as escrow
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create bounty record
+    (map-set bounties
+      { bounty-id: bounty-id }
+      {
+        creator: tx-sender,
+        amount: amount,
+        tier: tier,
+        github-issue-url: github-issue-url,
+        github-repo: github-repo,
+        title: title,
+        description: description,
+        status: bounty-status-open,
+        hunter: none,
+        created-at: block-height,
+        expires-at: expires-at,
+        claimed-at: none,
+        completed-at: none,
+        pr-url: none
+      }
+    )
+    
+    ;; Update user stats
+    (update-user-bounties-created tx-sender)
+    
+    ;; Update global stats
+    (var-set next-bounty-id (+ bounty-id u1))
+    (var-set total-bounties (+ (var-get total-bounties) u1))
+    (var-set total-volume (+ (var-get total-volume) amount))
+    
+    (ok bounty-id)
+  )
+)
+
+;; Claim a bounty (hunter expresses intent to work on it)
+(define-public (claim-bounty (bounty-id uint))
+  (let 
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+    )
+    (asserts! (is-eq (get status bounty) bounty-status-open) err-bounty-closed)
+    (asserts! (< block-height (get expires-at bounty)) err-bounty-expired)
+    (asserts! (is-none (get hunter bounty)) err-already-claimed)
+    
+    ;; Update bounty with hunter
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty {
+        status: bounty-status-claimed,
+        hunter: (some tx-sender),
+        claimed-at: (some block-height)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Complete bounty with PR URL (automatic payout simulation)
+(define-public (complete-bounty (bounty-id uint) (pr-url (string-ascii 256)))
+  (let 
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (hunter (unwrap! (get hunter bounty) err-unauthorized))
+      (fee-amount (calculate-platform-fee (get amount bounty)))
+      (payout-amount (- (get amount bounty) fee-amount))
+      (tier-mult (unwrap! (get multiplier (map-get? tier-multipliers { tier: (get tier bounty) })) err-invalid-tier))
+      (reputation-bonus (/ (* payout-amount tier-mult) u10000))
+    )
+    (asserts! (is-eq tx-sender hunter) err-unauthorized)
+    (asserts! (is-eq (get status bounty) bounty-status-claimed) err-bounty-closed)
+    (asserts! (< block-height (get expires-at bounty)) err-bounty-expired)
+    
+    ;; Update bounty status
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty {
+        status: bounty-status-completed,
+        completed-at: (some block-height),
+        pr-url: (some pr-url)
+      })
+    )
+    
+    ;; Transfer payout to hunter
+    (try! (as-contract (stx-transfer? payout-amount tx-sender hunter)))
+    
+    ;; Transfer fee to contract owner
+    (try! (as-contract (stx-transfer? fee-amount tx-sender contract-owner)))
+    
+    ;; Update hunter stats
+    (update-user-completion-stats hunter payout-amount reputation-bonus)
+    
+    (ok payout-amount)
+  )
+)
+
+;; Initiate dispute
+(define-public (create-dispute (bounty-id uint) (reason (string-ascii 256)))
+  (let 
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+    )
+    (asserts! (is-eq (get status bounty) bounty-status-completed) err-bounty-closed)
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (< (- block-height (unwrap! (get completed-at bounty) err-not-found)) dispute-period) err-dispute-period-active)
+    
+    ;; Create dispute record
+    (map-set disputes
+      { bounty-id: bounty-id }
+      {
+        disputer: tx-sender,
+        reason: reason,
+        created-at: block-height,
+        resolved: false,
+        resolution: none
+      }
+    )
+    
+    ;; Update bounty status
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { status: bounty-status-disputed })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve dispute (owner only)
+(define-public (resolve-dispute 
+  (bounty-id uint) 
+  (resolution (string-ascii 256))
+  (refund-creator bool))
+  (let 
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (dispute (unwrap! (map-get? disputes { bounty-id: bounty-id }) err-no-dispute))
+      (creator (get creator bounty))
+      (hunter (unwrap! (get hunter bounty) err-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get status bounty) bounty-status-disputed) err-bounty-closed)
+    (asserts! (not (get resolved dispute)) err-no-dispute)
+    
+    ;; Update dispute as resolved
+    (map-set disputes
+      { bounty-id: bounty-id }
+      (merge dispute {
+        resolved: true,
+        resolution: (some resolution)
+      })
+    )
+    
+    ;; Handle refund if necessary
+    (if refund-creator
+      (begin
+        ;; Refund creator (amount was already paid to hunter, so owner covers it)
+        (try! (stx-transfer? (get amount bounty) contract-owner creator))
+        ;; Update bounty status to cancelled
+        (map-set bounties
+          { bounty-id: bounty-id }
+          (merge bounty { status: bounty-status-cancelled })
+        )
+      )
+      ;; Update bounty status back to completed
+      (map-set bounties
+        { bounty-id: bounty-id }
+        (merge bounty { status: bounty-status-completed })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Cancel bounty (creator only, if not claimed)
+(define-public (cancel-bounty (bounty-id uint))
+  (let 
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (is-eq (get status bounty) bounty-status-open) err-bounty-closed)
+    
+    ;; Refund escrow to creator
+    (try! (as-contract (stx-transfer? (get amount bounty) tx-sender (get creator bounty))))
+    
+    ;; Update bounty status
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { status: bounty-status-cancelled })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Set platform fee (owner only)
+(define-public (set-platform-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-fee-rate u1000) err-invalid-amount) ;; Max 10%
+    (var-set platform-fee-rate new-fee-rate)
+    (ok true)
+  )
+)
+
+;; read only functions
+
+;; Get bounty details
+(define-read-only (get-bounty (bounty-id uint))
+  (map-get? bounties { bounty-id: bounty-id })
+)
+
+;; Get user stats
+(define-read-only (get-user-stats (user principal))
+  (default-to 
+    { bounties-created: u0, bounties-completed: u0, total-earned: u0, reputation-score: u0 }
+    (map-get? user-stats { user: user })
+  )
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (bounty-id uint))
+  (map-get? disputes { bounty-id: bounty-id })
+)
+
+;; Get platform stats
+(define-read-only (get-platform-stats)
+  {
+    total-bounties: (var-get total-bounties),
+    total-volume: (var-get total-volume),
+    platform-fee-rate: (var-get platform-fee-rate),
+    next-bounty-id: (var-get next-bounty-id)
+  }
+)
+
+;; Check if bounty is claimable
+(define-read-only (is-bounty-claimable (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty (and 
+      (is-eq (get status bounty) bounty-status-open)
+      (< block-height (get expires-at bounty))
+      (is-none (get hunter bounty))
+    )
+    false
+  )
+)
+
+;; Get active bounties count
+(define-read-only (get-active-bounties-count)
+  (len (filter is-bounty-active (list 
+    u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 ;; This would need to be dynamic in production
+  )))
+)
+
+;; Calculate platform fee
+(define-read-only (calculate-platform-fee (amount uint))
+  (/ (* amount (var-get platform-fee-rate)) u10000)
+)
