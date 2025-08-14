@@ -125,9 +125,14 @@
       (bounty-id (var-get next-bounty-id))
       (expires-at (+ block-height duration-blocks))
     )
+    ;; Input validation
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (and (>= tier tier-low) (<= tier tier-critical)) err-invalid-tier)
     (asserts! (<= duration-blocks max-bounty-duration) err-invalid-amount)
+    (asserts! (validate-string github-issue-url) err-invalid-amount)
+    (asserts! (validate-string github-repo) err-invalid-amount)
+    (asserts! (validate-string title) err-invalid-amount)
+    (asserts! (validate-string description) err-invalid-amount)
     
     ;; Transfer STX to contract as escrow
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -171,6 +176,8 @@
     (
       (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
     )
+    ;; Validate bounty exists and is claimable
+    (asserts! (validate-bounty-id bounty-id) err-not-found)
     (asserts! (is-eq (get status bounty) bounty-status-open) err-bounty-closed)
     (asserts! (< block-height (get expires-at bounty)) err-bounty-expired)
     (asserts! (is-none (get hunter bounty)) err-already-claimed)
@@ -200,6 +207,9 @@
       (tier-mult (unwrap! (get multiplier (map-get? tier-multipliers { tier: (get tier bounty) })) err-invalid-tier))
       (reputation-bonus (/ (* payout-amount tier-mult) u10000))
     )
+    ;; Validate inputs and conditions
+    (asserts! (validate-bounty-id bounty-id) err-not-found)
+    (asserts! (validate-string pr-url) err-invalid-amount)
     (asserts! (is-eq tx-sender hunter) err-unauthorized)
     (asserts! (is-eq (get status bounty) bounty-status-claimed) err-bounty-closed)
     (asserts! (< block-height (get expires-at bounty)) err-bounty-expired)
@@ -233,6 +243,9 @@
     (
       (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
     )
+    ;; Validate inputs and conditions
+    (asserts! (validate-bounty-id bounty-id) err-not-found)
+    (asserts! (validate-string reason) err-invalid-amount)
     (asserts! (is-eq (get status bounty) bounty-status-completed) err-bounty-closed)
     (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
     (asserts! (< (- block-height (unwrap! (get completed-at bounty) err-not-found)) dispute-period) err-dispute-period-active)
@@ -271,6 +284,9 @@
       (creator (get creator bounty))
       (hunter (unwrap! (get hunter bounty) err-not-found))
     )
+    ;; Validate inputs and conditions
+    (asserts! (validate-bounty-id bounty-id) err-not-found)
+    (asserts! (validate-string resolution) err-invalid-amount)
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (is-eq (get status bounty) bounty-status-disputed) err-bounty-closed)
     (asserts! (not (get resolved dispute)) err-no-dispute)
@@ -312,6 +328,8 @@
     (
       (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
     )
+    ;; Validate inputs and conditions
+    (asserts! (validate-bounty-id bounty-id) err-not-found)
     (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
     (asserts! (is-eq (get status bounty) bounty-status-open) err-bounty-closed)
     
@@ -342,6 +360,7 @@
 
 ;; Get bounty details
 (define-read-only (get-bounty (bounty-id uint))
+  ;; Safe to return none if bounty doesn't exist
   (map-get? bounties { bounty-id: bounty-id })
 )
 
@@ -355,6 +374,7 @@
 
 ;; Get dispute details
 (define-read-only (get-dispute (bounty-id uint))
+  ;; Safe to return none if dispute doesn't exist
   (map-get? disputes { bounty-id: bounty-id })
 )
 
@@ -390,4 +410,64 @@
 ;; Calculate platform fee
 (define-read-only (calculate-platform-fee (amount uint))
   (/ (* amount (var-get platform-fee-rate)) u10000)
+)
+
+;; private functions
+
+;; Validate string input to prevent common attacks
+(define-private (validate-string (input (string-ascii 512)))
+  (and 
+    (not (is-eq input "")) ;; Not empty
+    (not (is-eq input "null")) ;; Not null string
+    (not (is-eq input "undefined")) ;; Not undefined string
+    true
+  )
+)
+
+;; Validate bounty ID exists
+(define-private (validate-bounty-id (bounty-id uint))
+  (is-some (map-get? bounties { bounty-id: bounty-id }))
+)
+
+;; Update user bounties created count
+(define-private (update-user-bounties-created (user principal))
+  (let 
+    (
+      (current-stats (get-user-stats user))
+    )
+    (map-set user-stats
+      { user: user }
+      (merge current-stats {
+        bounties-created: (+ (get bounties-created current-stats) u1)
+      })
+    )
+  )
+)
+
+;; Update user completion stats
+(define-private (update-user-completion-stats (user principal) (earned uint) (reputation-bonus uint))
+  (let 
+    (
+      (current-stats (get-user-stats user))
+    )
+    (map-set user-stats
+      { user: user }
+      (merge current-stats {
+        bounties-completed: (+ (get bounties-completed current-stats) u1),
+        total-earned: (+ (get total-earned current-stats) earned),
+        reputation-score: (+ (get reputation-score current-stats) reputation-bonus)
+      })
+    )
+  )
+)
+
+;; Helper function for filtering active bounties
+(define-private (is-bounty-active (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty (or 
+      (is-eq (get status bounty) bounty-status-open)
+      (is-eq (get status bounty) bounty-status-claimed)
+    )
+    false
+  )
 )
